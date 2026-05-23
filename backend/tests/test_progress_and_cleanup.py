@@ -55,6 +55,47 @@ def test_write_streaming_response_to_file_skips_empty_chunks(tmp_path):
     assert output_path.read_bytes() == b"data"
 
 
+def test_write_streaming_response_to_file_reports_integer_progress_steps(tmp_path, monkeypatch):
+    class Response:
+        headers = {"content-length": "100"}
+
+        def iter_content(self, chunk_size=8192):
+            for _ in range(10):
+                yield b"x" * 10
+
+    updates = []
+    original_update = main.update_job_progress
+
+    def tracking_update(job, progress, message=None, status=None):
+        updates.append(int(progress))
+        original_update(job, progress, message, status)
+
+    monkeypatch.setattr(main, "update_job_progress", tracking_update)
+
+    job = main.Job(id="progress-job", url="https://cdn.example.com/source.mp4")
+    output_path = tmp_path / "media.bin"
+
+    main.write_streaming_response_to_file(
+        Response(),
+        output_path,
+        job=job,
+        progress_start=20.0,
+        progress_end=30.0,
+        message="動画をダウンロード中...",
+        status=main.JobStatus.DOWNLOADING,
+    )
+
+    assert output_path.read_bytes() == b"x" * 100
+    assert updates == list(range(20, 31))
+    assert job.progress == 30.0
+    assert job.status == main.JobStatus.DOWNLOADING
+    assert job.message == "動画をダウンロード中... 100B / 100B"
+
+
+def test_parse_progress_ignores_download_destination_as_conversion():
+    assert main.parse_progress("[download] Destination: generated.mp4") == (-1, "")
+
+
 @given(st.decimals(min_value=0, max_value=100, places=1))
 def test_parse_progress_scales_download_percent_to_seventy_percent(percent):
     line = f"[download] {percent}% of 10.00MiB at 1.00MiB/s ETA 00:10"

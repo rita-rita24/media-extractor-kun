@@ -116,6 +116,33 @@ def test_process_job_video_ytdlp_uses_requested_quality_format(quality, expected
     assert "--merge-output-format" in cmd
 
 
+def test_process_job_ytdlp_download_reset_uses_remaining_progress_range(monkeypatch):
+    FakePopen.output_extension = "mp4"
+    FakePopen.lines_to_use = [
+        "[download] 100.0% of 10.00MiB at 1.00MiB/s ETA 00:00\n",
+        "[download]   0.0% of 1.00MiB at 1.00MiB/s ETA 00:01\n",
+        "[download]  50.0% of 1.00MiB at 1.00MiB/s ETA 00:01\n",
+        "[download] 100.0% of 1.00MiB at 1.00MiB/s ETA 00:00\n",
+        '[Merger] Merging formats into "generated.mp4"\n',
+    ]
+    updates = []
+    original_update = main.update_job_progress
+
+    def tracking_update(job, progress, message=None, status=None):
+        updates.append(progress)
+        original_update(job, progress, message, status)
+
+    monkeypatch.setattr(main, "update_job_progress", tracking_update)
+    job = add_job(download_type=main.DownloadType.VIDEO)
+
+    main.process_job(job.id)
+
+    assert job.status == main.JobStatus.COMPLETED
+    assert any(70.0 < progress < 75.0 for progress in updates)
+    assert 75.0 in updates
+    assert 85.0 in updates
+
+
 def test_process_job_ytdlp_nonzero_exit_marks_failed_and_removes_output_dir():
     FakePopen.returncode_to_use = 1
     job = add_job()

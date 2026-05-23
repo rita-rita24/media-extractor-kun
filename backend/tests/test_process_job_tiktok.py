@@ -123,7 +123,7 @@ def test_process_job_tiktok_video_direct_exception_falls_back_to_tiksave(monkeyp
     def raising_get(*args, **kwargs):
         raise requests.Timeout("video timed out")
 
-    def fake_tiksave(url, output_path):
+    def fake_tiksave(url, output_path, **kwargs):
         with open(output_path, "wb") as file:
             file.write(b"mp4")
         return True
@@ -153,7 +153,7 @@ def test_process_job_tiktok_video_tiksave_fallback_success(monkeypatch, title, e
         lambda url: {"success": True, "video_url": None, "title": title},
     )
 
-    def fake_tiksave(url, output_path):
+    def fake_tiksave(url, output_path, **kwargs):
         with open(output_path, "wb") as file:
             file.write(b"mp4")
         return True
@@ -175,7 +175,7 @@ def test_process_job_tiktok_all_direct_video_methods_fall_back_to_ytdlp_with_dir
         lambda url: {"success": True, "video_url": "https://video.example/video.mp4", "title": "normal"},
     )
     monkeypatch.setattr(requests, "get", lambda url, timeout, stream: FakeContentResponse(status_code=503))
-    monkeypatch.setattr(main, "download_tiktok_via_tiksave", lambda url, output_path: False)
+    monkeypatch.setattr(main, "download_tiktok_via_tiksave", lambda url, output_path, **kwargs: False)
     FakePopen.output_extension = "mp4"
     job = add_job("tiktok-video-ytdlp", url="https://www.tiktok.com/@u/video/1", download_type=main.DownloadType.VIDEO)
 
@@ -194,7 +194,7 @@ def test_process_job_tiktok_subscriber_tiksave_failure_continues_to_direct_video
         "get_tiktok_video_info",
         lambda url: {"success": True, "video_url": "https://video.example/video.mp4", "title": "subscriber only"},
     )
-    monkeypatch.setattr(main, "download_tiktok_via_tiksave", lambda url, output_path: False)
+    monkeypatch.setattr(main, "download_tiktok_via_tiksave", lambda url, output_path, **kwargs: False)
     monkeypatch.setattr(
         requests,
         "get",

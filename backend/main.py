@@ -220,11 +220,52 @@ def ensure_download_size_within_limit(size: int) -> None:
         raise Exception(f"ファイルサイズが上限を超えています（最大{max_mb}MB）")
 
 
-def write_streaming_response_to_file(response, output_path: Path) -> None:
+def clamp_progress(progress: float) -> float:
+    return max(0.0, min(100.0, progress))
+
+
+def format_bytes(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f}MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size}B"
+
+
+def update_job_progress(
+    job: Job,
+    progress: float,
+    message: Optional[str] = None,
+    status: Optional[JobStatus] = None,
+) -> None:
+    progress = clamp_progress(progress)
+    with jobs_lock:
+        if status is not None:
+            job.status = status
+        if progress >= job.progress:
+            job.progress = progress
+        if message is not None:
+            job.message = message
+
+
+def write_streaming_response_to_file(
+    response,
+    output_path: Path,
+    job: Optional[Job] = None,
+    progress_start: float = 0.0,
+    progress_end: float = 100.0,
+    message: str = "ダウンロード中...",
+    status: Optional[JobStatus] = None,
+) -> None:
     total_size = get_content_length(response.headers)
     ensure_download_size_within_limit(total_size)
 
     downloaded = 0
+    last_reported_progress = int(progress_start) - 1
+    last_reported_bytes = 0
+    if job:
+        update_job_progress(job, progress_start, message, status)
+
     with open(output_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=8192):
             if not chunk:
@@ -232,6 +273,26 @@ def write_streaming_response_to_file(response, output_path: Path) -> None:
             downloaded += len(chunk)
             ensure_download_size_within_limit(downloaded)
             f.write(chunk)
+
+            if not job:
+                continue
+
+            if total_size > 0:
+                progress = progress_start + (downloaded / total_size) * (progress_end - progress_start)
+                progress = min(progress, progress_end)
+                progress_bucket = int(progress)
+                if progress_bucket > last_reported_progress or downloaded >= total_size:
+                    last_reported_progress = progress_bucket
+                    update_job_progress(
+                        job,
+                        progress,
+                        f"{message} {format_bytes(downloaded)} / {format_bytes(total_size)}",
+                        status,
+                    )
+            else:
+                if last_reported_bytes == 0 or downloaded - last_reported_bytes >= 1024 * 1024:
+                    last_reported_bytes = downloaded
+                    update_job_progress(job, progress_start, f"{message} {format_bytes(downloaded)}", status)
 
 
 def read_process_output_with_timeout(process, timeout_seconds: int):
@@ -330,21 +391,32 @@ def cleanup_old_jobs():
             del jobs[job_id]
 
 
+def parse_download_percent(line: str) -> Optional[float]:
+    if "[download]" not in line or "%" not in line:
+        return None
+    try:
+        match = re.search(r"(\d+\.?\d*)%", line)
+        if match:
+            return float(match.group(1))
+    except:
+        pass
+    return None
+
+
+def map_download_progress(percent: float, progress_start: float = 0.0, progress_end: float = 70.0) -> float:
+    return progress_start + (percent / 100.0) * (progress_end - progress_start)
+
+
 def parse_progress(line: str) -> tuple[float, str]:
     """yt-dlpの出力から進捗をパース"""
     # ダウンロード進捗: [download]  45.2% of 150.00MiB at 5.00MiB/s ETA 00:20
-    if "[download]" in line and "%" in line:
-        try:
-            match = re.search(r"(\d+\.?\d*)%", line)
-            if match:
-                percent = float(match.group(1))
-                # ダウンロードは全体の70%とみなす
-                return percent * 0.7, f"ダウンロード中... {percent:.1f}%"
-        except:
-            pass
+    percent = parse_download_percent(line)
+    if percent is not None:
+        # ダウンロードは全体の70%とみなす
+        return map_download_progress(percent), f"ダウンロード中... {percent:.1f}%"
 
     # 変換中
-    if "[ExtractAudio]" in line or "Destination:" in line:
+    if "[ExtractAudio]" in line:
         return 75.0, "音声を変換中..."
 
     # Post-processing
@@ -418,7 +490,14 @@ def get_tiktok_video_info(url: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def download_tiktok_via_tiksave(url: str, output_path: str) -> bool:
+def download_tiktok_via_tiksave(
+    url: str,
+    output_path: str,
+    job: Optional[Job] = None,
+    progress_start: float = 25.0,
+    progress_end: float = 95.0,
+    message: str = "予備サーバーでダウンロード中...",
+) -> bool:
     """tiksave.ioを使用してTikTok動画をダウンロード（サブスク限定動画対応）"""
     import cloudscraper
     from bs4 import BeautifulSoup
@@ -431,10 +510,16 @@ def download_tiktok_via_tiksave(url: str, output_path: str) -> bool:
             browser={'browser': 'chrome', 'platform': 'darwin', 'desktop': True}
         )
 
+        if job:
+            update_job_progress(job, 15.0, "予備サーバーを確認中...", JobStatus.DOWNLOADING)
+
         # 1. メインページアクセス
         scraper.get("https://tiksave.io/ja")
 
         # 2. APIリクエスト
+        if job:
+            update_job_progress(job, 20.0, "ダウンロードリンクを取得中...", JobStatus.DOWNLOADING)
+
         api_url = "https://tiksave.io/api/ajaxSearch"
         data = {"q": url, "lang": "ja"}
 
@@ -478,7 +563,15 @@ def download_tiktok_via_tiksave(url: str, output_path: str) -> bool:
         validate_direct_media_response_url(download_link)
         r_down = scraper.get(download_link, headers=headers, stream=True)
         if r_down.status_code == 200:
-            write_streaming_response_to_file(r_down, Path(output_path))
+            write_streaming_response_to_file(
+                r_down,
+                Path(output_path),
+                job=job,
+                progress_start=progress_start,
+                progress_end=progress_end,
+                message=message,
+                status=JobStatus.DOWNLOADING,
+            )
 
             # ファイルサイズチェック
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
@@ -546,24 +639,16 @@ def process_job(job_id: str):
                 response = req.get(redirect_url, timeout=300, stream=True, allow_redirects=False)
 
             if response.status_code == 200:
-                # ファイルサイズ取得（進捗表示用）
-                total_size = get_content_length(response.headers)
-                ensure_download_size_within_limit(total_size)
-                downloaded = 0
-
                 output_path = output_dir / f"{base_filename}{ext}"
-                with open(output_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if not chunk:
-                            continue
-                        downloaded += len(chunk)
-                        ensure_download_size_within_limit(downloaded)
-                        f.write(chunk)
-                        if total_size > 0:
-                            progress = 10 + (downloaded / total_size) * 85
-                            with jobs_lock:
-                                job.progress = progress
-                                job.message = f"ダウンロード中... {downloaded // 1024 // 1024}MB / {total_size // 1024 // 1024}MB"
+                write_streaming_response_to_file(
+                    response,
+                    output_path,
+                    job=job,
+                    progress_start=10.0,
+                    progress_end=95.0,
+                    message="ダウンロード中...",
+                    status=JobStatus.DOWNLOADING,
+                )
 
                 # 完了
                 with jobs_lock:
@@ -598,9 +683,7 @@ def process_job(job_id: str):
             if tiktok_info.get("success"):
                 # 音声抽出でmusic_urlがある場合は直接ダウンロード
                 if job.download_type == DownloadType.AUDIO and tiktok_info.get("music_url"):
-                    with jobs_lock:
-                        job.message = "音声をダウンロード中..."
-                        job.progress = 50.0
+                    update_job_progress(job, 20.0, "音声をダウンロード中...", JobStatus.DOWNLOADING)
 
                     # 直接ダウンロード
                     import requests as req
@@ -610,7 +693,15 @@ def process_job(job_id: str):
                     audio_response = req.get(music_url, timeout=120, stream=True)
                     if audio_response.status_code == 200:
                         output_path = output_dir / f"{base_filename}.mp3"
-                        write_streaming_response_to_file(audio_response, output_path)
+                        write_streaming_response_to_file(
+                            audio_response,
+                            output_path,
+                            job=job,
+                            progress_start=20.0,
+                            progress_end=95.0,
+                            message="音声をダウンロード中...",
+                            status=JobStatus.DOWNLOADING,
+                        )
 
                         # 完了
                         with jobs_lock:
@@ -637,7 +728,14 @@ def process_job(job_id: str):
                 if job.download_type == DownloadType.VIDEO and is_subscriber_only:
                     print(f"Subscriber-only video detected: {title}. Trying tiksave.io first.")
                     output_path = output_dir / f"{base_filename}.mp4"
-                    if download_tiktok_via_tiksave(job.url, str(output_path)):
+                    if download_tiktok_via_tiksave(
+                        job.url,
+                        str(output_path),
+                        job=job,
+                        progress_start=25.0,
+                        progress_end=95.0,
+                        message="予備サーバーでダウンロード中...",
+                    ):
                         download_success = True
                         with jobs_lock:
                             job.status = JobStatus.COMPLETED
@@ -649,9 +747,7 @@ def process_job(job_id: str):
 
                 # 2. 通常のtikwm.com直接ダウンロード
                 if not download_success and job.download_type == DownloadType.VIDEO and tiktok_info.get("video_url"):
-                    with jobs_lock:
-                        job.message = "動画をダウンロード中..."
-                        job.progress = 50.0
+                    update_job_progress(job, 20.0, "動画をダウンロード中...", JobStatus.DOWNLOADING)
 
                     try:
                         # tikwm.comからダウンロード
@@ -664,16 +760,15 @@ def process_job(job_id: str):
 
                         if video_response.status_code == 200:
                             output_path = output_dir / f"{base_filename}.mp4"
-                            with open(output_path, "wb") as f:
-                                downloaded = 0
-                                total_size = get_content_length(video_response.headers)
-                                ensure_download_size_within_limit(total_size)
-                                for chunk in video_response.iter_content(chunk_size=8192):
-                                    if not chunk:
-                                        continue
-                                    downloaded += len(chunk)
-                                    ensure_download_size_within_limit(downloaded)
-                                    f.write(chunk)
+                            write_streaming_response_to_file(
+                                video_response,
+                                output_path,
+                                job=job,
+                                progress_start=20.0,
+                                progress_end=95.0,
+                                message="動画をダウンロード中...",
+                                status=JobStatus.DOWNLOADING,
+                            )
 
                             print(f"Direct download successful. Size: {os.path.getsize(output_path)} bytes")
                             download_success = True
@@ -688,16 +783,22 @@ def process_job(job_id: str):
                         else:
                             print(f"Direct video download failed: {video_response.status_code}")
                     except Exception as e:
-                         print(f"Direct video download error: {e}")
+                        print(f"Direct video download error: {e}")
 
                 # 3. TikSaveへのフォールバック（tikwmが失敗した場合）
                 if not download_success and job.download_type == DownloadType.VIDEO:
                     print("Falling back to tiksave.io...")
-                    with jobs_lock:
-                         job.message = "予備サーバーでダウンロード中..."
+                    update_job_progress(job, 20.0, "予備サーバーでダウンロード中...", JobStatus.DOWNLOADING)
 
                     output_path = output_dir / f"{base_filename}.mp4"
-                    if download_tiktok_via_tiksave(job.url, str(output_path)):
+                    if download_tiktok_via_tiksave(
+                        job.url,
+                        str(output_path),
+                        job=job,
+                        progress_start=25.0,
+                        progress_end=95.0,
+                        message="予備サーバーでダウンロード中...",
+                    ):
                         download_success = True
                         with jobs_lock:
                             job.status = JobStatus.COMPLETED
@@ -709,7 +810,7 @@ def process_job(job_id: str):
 
                 # 4. 最終手段: yt-dlpへのフォールバック
                 print("All direct methods failed. Falling back to yt-dlp...")
-                target_url = tiktok_info.get("video_url") or job.url # urlフォールバック
+                target_url = tiktok_info.get("video_url") or job.url  # urlフォールバック
 
                 with jobs_lock:
                     job.message = "ダウンロード中（標準モード）..."
@@ -780,23 +881,35 @@ def process_job(job_id: str):
         )
 
         # リアルタイム進捗更新
+        last_download_percent = None
+        download_progress_start = 5.0
+        download_progress_end = 70.0
         for line in read_process_output_with_timeout(process, MAX_DURATION_SECONDS):
             line = line.strip()
             if not line:
                 continue
 
-            progress, message = parse_progress(line)
-            if progress >= 0:
-                with jobs_lock:
-                    job.progress = progress
-                    job.message = message
-
             # 変換フェーズ検出
-            if "[ExtractAudio]" in line or "[Merger]" in line:
-                with jobs_lock:
-                    job.status = JobStatus.CONVERTING
-                    job.progress = 75.0
-                    job.message = convert_message
+            if "[ExtractAudio]" in line:
+                update_job_progress(job, 75.0, convert_message, JobStatus.CONVERTING)
+                continue
+            if "[Merger]" in line or "Merging" in line:
+                update_job_progress(job, 85.0, "ファイルを処理中...", JobStatus.CONVERTING)
+                continue
+
+            download_percent = parse_download_percent(line)
+            if download_percent is not None:
+                if last_download_percent is not None and download_percent + 1.0 < last_download_percent:
+                    download_progress_start = max(job.progress, download_progress_start)
+                    download_progress_end = 75.0
+                progress = map_download_progress(download_percent, download_progress_start, download_progress_end)
+                update_job_progress(
+                    job,
+                    progress,
+                    f"ダウンロード中... {download_percent:.1f}%",
+                    JobStatus.DOWNLOADING,
+                )
+                last_download_percent = download_percent
 
         if process.returncode != 0:
             raise Exception("yt-dlpの実行に失敗しました")

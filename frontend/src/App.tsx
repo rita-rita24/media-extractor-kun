@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { forwardRef, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 type Status = 'idle' | 'processing' | 'completed' | 'error'
@@ -139,6 +139,7 @@ function App() {
   const [customFilename, setCustomFilename] = useState('')
   const [downloadType, setDownloadType] = useState<DownloadType>('audio')
   const [status, setStatus] = useState<Status>(visualMode === 'complete' ? 'completed' : 'idle')
+  const [isModalOpen, setIsModalOpen] = useState(visualMode === 'complete')
   const [jobId, setJobId] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const [message, setMessage] = useState('')
@@ -147,6 +148,7 @@ function App() {
     visualMode === 'complete' ? DEFAULT_COMPLETE_FILENAME : null,
   )
   const pollingRef = useRef<number | null>(null)
+  const modalRef = useRef<HTMLDivElement | null>(null)
 
   const selectedFormat = useMemo(() => getFileFormat(downloadType, filename || ''), [downloadType, filename])
 
@@ -156,6 +158,18 @@ function App() {
       pollingRef.current = null
     }
   }
+
+  useEffect(() => {
+    if (!isModalOpen) return
+
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    modalRef.current?.focus()
+
+    return () => {
+      document.body.style.overflow = previousOverflow
+    }
+  }, [isModalOpen])
 
   useEffect(() => {
     if (!jobId || status !== 'processing') return
@@ -193,6 +207,7 @@ function App() {
       return
     }
 
+    setIsModalOpen(true)
     setStatus('processing')
     setProgress(0)
     setMessage('ジョブを開始中...')
@@ -238,6 +253,7 @@ function App() {
     }
     stopPolling()
     setStatus('idle')
+    setIsModalOpen(false)
     setJobId(null)
     setProgress(0)
     setMessage('')
@@ -246,17 +262,6 @@ function App() {
     setUrl('')
     setCustomFilename('')
     setDownloadType('audio')
-  }
-
-  if (status === 'completed' && filename) {
-    return (
-      <CompleteView
-        filename={filename}
-        format={selectedFormat}
-        onDownload={handleDownload}
-        onReset={handleReset}
-      />
-    )
   }
 
   return (
@@ -270,16 +275,6 @@ function App() {
               <span className="brand-subtitle">動画や音声を、かんたんにローカル保存</span>
             </span>
           </a>
-          <nav className="header-nav" aria-label="メインナビゲーション">
-            <a href="#usage" className="nav-link">
-              <span className="material-symbols-outlined" aria-hidden="true">menu_book</span>
-              使い方
-            </a>
-            <a href="#faq" className="nav-link">
-              <span className="material-symbols-outlined" aria-hidden="true">help</span>
-              よくある質問
-            </a>
-          </nav>
         </div>
       </header>
 
@@ -357,24 +352,14 @@ function App() {
         <button
           type="button"
           className="primary-button"
-          disabled={!url.trim() || status === 'processing'}
+          disabled={!url.trim() || status === 'processing' || isModalOpen}
           onClick={handleExtract}
         >
           <span className="material-symbols-outlined" aria-hidden="true">download</span>
           {status === 'processing' ? '抽出しています' : '抽出を開始'}
         </button>
 
-        {status === 'processing' && (
-          <div className="progress-area" role="status" aria-live="polite">
-            <span>{message || '処理を開始しています'}</span>
-            <span>{progress.toFixed(0)}%</span>
-            <div className="progress-track" aria-hidden="true">
-              <div className="progress-fill" style={{ width: `${progress}%` }}></div>
-            </div>
-          </div>
-        )}
-
-        {(error || status === 'error') && status !== 'processing' && (
+        {error && !isModalOpen && (
           <p className="error-message" role="alert">{error}</p>
         )}
 
@@ -385,38 +370,31 @@ function App() {
       </section>
 
       <section className="trust-row" aria-label="サービスの特徴">
-        <FeatureCard icon="shield_lock" title="ローカル保存">
+        <FeatureCard icon="save" title="ローカル保存">
           変換結果はこの端末に保存。<br />処理後の一時ファイルは削除できます。
         </FeatureCard>
-        <FeatureCard icon="history" title="履歴なし">
+        <FeatureCard icon="history_toggle_off" title="履歴なし">
           URLやファイルは保存されません。<br />使い終わったらすぐに消えます。
         </FeatureCard>
-        <FeatureCard icon="eco" title="インストール不要">
+        <FeatureCard icon="open_in_browser" title="インストール不要">
           ブラウザだけで使えます。<br />いつでも、どこでも利用可能。
         </FeatureCard>
       </section>
 
-      <section id="usage" className="capability-card" aria-labelledby="capability-title">
-        <div className="capability-heading">
-          <img src="/assets/brand-sprout.png" alt="" />
-          <h2 id="capability-title">できること</h2>
-        </div>
-        <div className="capability-grid">
-          <CapabilityItem title="YouTube / TikTok / Instagram / X などに対応">
-            対応サービスの動画・音声URLを貼り付けるだけ
-          </CapabilityItem>
-          <CapabilityItem title="高品質のまま、すばやく抽出">
-            シンプル設計で迷わず使えます
-          </CapabilityItem>
-          <CapabilityItem title="音声も動画も、かんたん保存">
-            MP3 / MP4 に対応
-          </CapabilityItem>
-          <CapabilityItem title="メディアファイルにも対応">
-            .mp3 / .mp4 などの直接URLもOK
-          </CapabilityItem>
-        </div>
-        <img className="plant-illustration" src="/assets/feature-plant.png" alt="" />
-      </section>
+      {isModalOpen && (
+        <ExtractModal
+          ref={modalRef}
+          status={status}
+          progress={progress}
+          message={message}
+          error={error}
+          filename={filename}
+          format={selectedFormat}
+          canDownload={Boolean(jobId && filename)}
+          onDownload={handleDownload}
+          onClose={handleReset}
+        />
+      )}
     </main>
   )
 }
@@ -430,8 +408,9 @@ interface FeatureCardProps {
 function FeatureCard({ icon, title, children }: FeatureCardProps) {
   return (
     <article className="feature-card">
-      <span className="feature-glow" aria-hidden="true"></span>
-      <span className="material-symbols-outlined feature-icon" aria-hidden="true">{icon}</span>
+      <span className="feature-icon-shell" aria-hidden="true">
+        <span className="material-symbols-outlined feature-icon">{icon}</span>
+      </span>
       <div>
         <h3>{title}</h3>
         <p>{children}</p>
@@ -440,119 +419,136 @@ function FeatureCard({ icon, title, children }: FeatureCardProps) {
   )
 }
 
-interface CapabilityItemProps {
-  title: string
-  children: React.ReactNode
-}
-
-function CapabilityItem({ title, children }: CapabilityItemProps) {
-  return (
-    <div className="capability-item">
-      <span className="mini-check" aria-hidden="true"></span>
-      <div>
-        <h3>{title}</h3>
-        <p>{children}</p>
-      </div>
-    </div>
-  )
-}
-
-interface CompleteViewProps {
-  filename: string
+type ExtractModalProps = {
+  status: Status
+  progress: number
+  message: string
+  error: string
+  filename: string | null
   format: 'MP3' | 'MP4'
+  canDownload: boolean
   onDownload: () => void
-  onReset: () => void
+  onClose: () => void
 }
 
-function CompleteView({ filename, format, onDownload, onReset }: CompleteViewProps) {
-  return (
-    <main className="complete-screen">
-      <section className="complete-card" aria-labelledby="complete-title">
-        <div className="confetti" aria-hidden="true">
-          <span className="piece piece-a"></span>
-          <span className="piece piece-b"></span>
-          <span className="piece piece-c"></span>
-          <span className="piece piece-d"></span>
-          <span className="piece piece-e"></span>
-          <span className="piece piece-f"></span>
-          <span className="piece piece-g"></span>
-        </div>
-        <div className="success-mark" aria-hidden="true">
-          <span className="material-symbols-outlined">check</span>
-        </div>
-        <h1 id="complete-title">抽出が完了しました！</h1>
-        <p className="complete-lead">ファイルの準備ができました。</p>
+const getModalIcon = (status: Status) => {
+  if (status === 'completed') return 'check'
+  if (status === 'error') return 'error'
+  return 'downloading'
+}
 
-        <ol className="stepper" aria-label="処理状況">
-          {['URL確認', 'ダウンロード', '変換', '完了'].map((label) => (
-            <li key={label}>
+const getModalTitle = (status: Status) => {
+  if (status === 'completed') return '抽出が完了しました！'
+  if (status === 'error') return '抽出に失敗しました'
+  return '抽出しています'
+}
+
+const progressSteps = ['URL確認', 'ダウンロード', '変換', '完了']
+
+function getStepClassName(index: number, status: Status, progress: number) {
+  if (status === 'completed') return 'is-complete'
+  if (status === 'error') return index === 0 ? 'is-complete' : ''
+
+  const activeIndex = progress >= 75 ? 2 : progress >= 10 ? 1 : 0
+  if (index < activeIndex) return 'is-complete'
+  if (index === activeIndex) return 'is-active'
+  return ''
+}
+
+const ExtractModal = forwardRef<HTMLDivElement, ExtractModalProps>(function ExtractModal(
+  { status, progress, message, error, filename, format, canDownload, onDownload, onClose },
+  ref,
+) {
+  const title = getModalTitle(status)
+  const modalProgress = status === 'completed' ? 100 : progress
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        ref={ref}
+        className={`extract-modal extract-modal-${status}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="extract-modal-title"
+        tabIndex={-1}
+      >
+        <div className="modal-heading">
+          <span className="modal-status-mark" aria-hidden="true">
+            <span className="material-symbols-outlined">{getModalIcon(status)}</span>
+          </span>
+          <div>
+            <p className="modal-kicker">{format}として保存</p>
+            <h2 id="extract-modal-title">{title}</h2>
+          </div>
+        </div>
+
+        <div className="modal-progress" role="status" aria-live="polite">
+          <div className="progress-copy">
+            <span>{status === 'completed' ? 'ファイルの準備ができました。' : message || '処理を開始しています'}</span>
+            <strong>{modalProgress.toFixed(0)}%</strong>
+          </div>
+          <div className="progress-track" aria-hidden="true">
+            <div className="progress-fill" style={{ width: `${modalProgress}%` }}></div>
+          </div>
+        </div>
+
+        <ol className="modal-stepper" aria-label="処理状況">
+          {progressSteps.map((label, index) => (
+            <li key={label} className={getStepClassName(index, status, modalProgress)}>
               <span className="step-check" aria-hidden="true">
-                <span className="material-symbols-outlined">check</span>
+                <span className="material-symbols-outlined">
+                  {getStepClassName(index, status, modalProgress) === 'is-complete' ? 'check' : 'fiber_manual_record'}
+                </span>
               </span>
               <span>{label}</span>
             </li>
           ))}
         </ol>
 
-        <div className="file-summary" aria-label="ファイル情報">
-          <div className="file-art" aria-hidden="true">
-            <span className="material-symbols-outlined">music_note</span>
+        {status === 'completed' && filename && (
+          <div className="modal-file-summary" aria-label="ファイル情報">
+            <span className="modal-file-icon" aria-hidden="true">
+              <span className="material-symbols-outlined">{format === 'MP4' ? 'movie' : 'music_note'}</span>
+            </span>
+            <dl>
+              <div>
+                <dt>ファイル名</dt>
+                <dd>{filename}</dd>
+              </div>
+              <div>
+                <dt>形式</dt>
+                <dd>{format}</dd>
+              </div>
+            </dl>
           </div>
-          <dl>
-            <div>
-              <dt>
-                <span className="material-symbols-outlined" aria-hidden="true">description</span>
-                ファイル名
-              </dt>
-              <dd>{filename}</dd>
-            </div>
-            <div>
-              <dt>
-                <span className="material-symbols-outlined" aria-hidden="true">music_note</span>
-                形式
-              </dt>
-              <dd>{format}</dd>
-            </div>
-            <div>
-              <dt>
-                <span className="material-symbols-outlined" aria-hidden="true">inbox</span>
-                サイズ
-              </dt>
-              <dd>24.7 MB</dd>
-            </div>
-            <div>
-              <dt>
-                <span className="material-symbols-outlined" aria-hidden="true">folder</span>
-                保存先
-              </dt>
-              <dd>ダウンロードフォルダ</dd>
-            </div>
-          </dl>
-        </div>
+        )}
 
-        <button
-          type="button"
-          className="download-button"
-          onClick={onDownload}
-        >
-          <span className="material-symbols-outlined" aria-hidden="true">download</span>
-          ダウンロード
-        </button>
-        <button type="button" className="close-button" onClick={onReset}>閉じる</button>
+        {status === 'error' && (
+          <p className="modal-error" role="alert">
+            {error || '処理に失敗しました'}
+          </p>
+        )}
 
-        <div className="safe-notes">
-          <p>
-            <span className="material-symbols-outlined" aria-hidden="true">verified_user</span>
-            正常に準備できました。
-          </p>
-          <p>
-            <span className="material-symbols-outlined" aria-hidden="true">lock</span>
-            ファイルはこの端末に保存されます
-          </p>
+        <div className="modal-actions">
+          {status === 'completed' && (
+            <button
+              type="button"
+              className="download-button"
+              disabled={!canDownload}
+              onClick={onDownload}
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">download</span>
+              ダウンロード
+            </button>
+          )}
+
+          {status !== 'processing' && (
+            <button type="button" className="close-button" onClick={onClose}>閉じる</button>
+          )}
         </div>
       </section>
-    </main>
+    </div>
   )
-}
+})
 
 export default App

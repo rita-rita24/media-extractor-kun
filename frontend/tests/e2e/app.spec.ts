@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test'
 
 test('completes the extraction flow after the API job finishes', async ({ page }) => {
   const extractRequests: unknown[] = []
+  let jobPollCount = 0
 
   await page.route('**/api/extract', async (route) => {
     extractRequests.push(route.request().postDataJSON())
@@ -18,15 +19,18 @@ test('completes the extraction flow after the API job finishes', async ({ page }
   })
 
   await page.route('**/api/job/job-1', async (route) => {
+    jobPollCount += 1
+    const isComplete = jobPollCount > 1
+
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
         job_id: 'job-1',
-        status: 'completed',
-        progress: 100,
-        message: '完了！',
-        filename: 'clip.mp3',
+        status: isComplete ? 'completed' : 'downloading',
+        progress: isComplete ? 100 : 40,
+        message: isComplete ? '完了！' : 'ダウンロード中...',
+        filename: isComplete ? 'clip.mp3' : undefined,
       }),
     })
   })
@@ -36,8 +40,11 @@ test('completes the extraction flow after the API job finishes', async ({ page }
   await page.getByLabel('ファイル名（任意）').fill('clip')
   await page.getByRole('button', { name: '抽出を開始' }).click()
 
-  await expect(page.getByRole('heading', { name: '抽出が完了しました！' })).toBeVisible()
-  await expect(page.getByText('clip.mp3')).toBeVisible()
+  await expect(page.getByRole('dialog', { name: '抽出しています' })).toBeVisible()
+  await expect(page.getByRole('dialog')).toContainText('40%')
+  await expect(page.getByLabel('メディアのURLを貼り付け')).toBeVisible()
+  await expect(page.getByRole('dialog', { name: '抽出が完了しました！' })).toBeVisible()
+  await expect(page.getByRole('dialog')).toContainText('clip.mp3')
   expect(extractRequests).toEqual([
     {
       url: 'https://youtu.be/abc_123',
@@ -61,6 +68,7 @@ test('shows an API error instead of leaving the user without feedback', async ({
   await page.getByLabel('メディアのURLを貼り付け').fill('https://youtu.be/abc_123')
   await page.getByRole('button', { name: '抽出を開始' }).click()
 
+  await expect(page.getByRole('dialog', { name: '抽出に失敗しました' })).toBeVisible()
   await expect(page.getByRole('alert')).toContainText('サーバー内部で失敗しました')
 })
 
@@ -76,6 +84,7 @@ test('rejects unsupported URLs before calling the API', async ({ page }) => {
   await page.getByRole('button', { name: '抽出を開始' }).click()
 
   await expect(page.getByRole('alert')).toContainText('対応していないURLです')
+  await expect(page.getByRole('dialog')).toHaveCount(0)
   expect(extractCalled).toBe(false)
 })
 
@@ -124,9 +133,10 @@ test('accepts supported social platform URLs for both audio and video requests',
     })
   })
 
+  await page.goto('/')
+
   for (const [, url] of matrix) {
     for (const downloadType of ['audio', 'video'] as const) {
-      await page.goto('/')
       await page.getByLabel('メディアのURLを貼り付け').fill(url)
       if (downloadType === 'video') {
         await page.getByLabel('動画').check()
@@ -138,11 +148,14 @@ test('accepts supported social platform URLs for both audio and video requests',
         url,
         download_type: downloadType,
       })
+      await expect(page.getByRole('dialog', { name: '抽出が完了しました！' })).toBeVisible()
+      await page.getByRole('button', { name: '閉じる' }).click()
+      await expect(page.getByRole('dialog')).toHaveCount(0)
     }
   }
 })
 
-test('can reset from the completed view and deletes the server job', async ({ page }) => {
+test('can close the completed modal and deletes the server job', async ({ page }) => {
   let deleteCalled = false
 
   await page.route('**/api/extract', async (route) => {
