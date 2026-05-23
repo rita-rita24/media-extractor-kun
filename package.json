@@ -1,0 +1,27 @@
+{
+  "name": "youtube-audio-cast-tool",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "setup": "npm run setup:web && npm run setup:api",
+    "setup:api": "cd backend && python3 -m venv venv && venv/bin/python -m pip install -r requirements.txt",
+    "setup:api:dev": "cd backend && venv/bin/python -m pip install -r requirements-dev.txt",
+    "setup:web": "npm --prefix frontend install",
+    "dev": "concurrently --kill-others --names api,web \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "cd backend && venv/bin/python -m uvicorn main:app --reload --port 8000",
+    "dev:web": "npm --prefix frontend run dev",
+    "test": "npm run test:api",
+    "test:api": "cd backend && venv/bin/python -m pytest",
+    "test:e2e": "npm --prefix frontend run test:e2e",
+    "test:coverage": "mkdir -p reports && cd backend && venv/bin/python -m pytest --cov=main --cov-branch --cov-report=term-missing --cov-report=json:../reports/coverage.json",
+    "test:mutation": "cd backend && venv/bin/python tests/mutation_smoke.py",
+    "test:social:smoke": "backend/venv/bin/python tools/verify_social_platforms.py",
+    "build": "npm run build:web",
+    "build:web": "npm --prefix frontend run build",
+    "preview": "npm run preview:web",
+    "preview:web": "npm --prefix frontend run preview"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  }
+}

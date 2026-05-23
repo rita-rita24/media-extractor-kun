@@ -1,0 +1,40 @@
+# OS files
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node dependencies and build output
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+
+# Node logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+venv/
+.venv/
+backend/venv/
+
+# Test and generated reports
+reports/
+playwright-report/
+test-results/
+frontend/playwright-report/
+frontend/test-results/
+
+# Local generated scratch files
+backend/tiktok_*.json
