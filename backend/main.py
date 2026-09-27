@@ -1,25 +1,28 @@
-import os
-import re
-import uuid
-import asyncio
-import shutil
-import time
-import string
-import random
 import ipaddress
+import logging
+import os
 import queue
+import random
+import re
+import shutil
 import socket
-from pathlib import Path
+import string
+import subprocess
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
-from dataclasses import dataclass, field
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import subprocess
-import threading
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Video Audio Extractor API")
 
@@ -68,16 +71,16 @@ class DownloadType(str, Enum):
 class Job:
     id: str
     url: str
-    custom_filename: Optional[str] = None
+    custom_filename: str | None = None
     download_type: DownloadType = DownloadType.AUDIO
     video_quality: str = "720p"
     status: JobStatus = JobStatus.PENDING
     progress: float = 0.0
     message: str = "待機中..."
-    filename: Optional[str] = None
-    error: Optional[str] = None
+    filename: str | None = None
+    error: str | None = None
     created_at: datetime = field(default_factory=datetime.now)
-    completed_at: Optional[datetime] = None
+    completed_at: datetime | None = None
 
 
 # インメモリジョブストア
@@ -94,7 +97,7 @@ def count_active_jobs_locked() -> int:
     return sum(1 for job in jobs.values() if job.status not in TERMINAL_JOB_STATUSES)
 
 
-def is_job_start_rate_limited(client_id: str, now: Optional[float] = None) -> bool:
+def is_job_start_rate_limited(client_id: str, now: float | None = None) -> bool:
     now = time.monotonic() if now is None else now
     window_start = now - JOB_RATE_LIMIT_WINDOW_SECONDS
 
@@ -121,7 +124,7 @@ def generate_random_filename(length: int = 8) -> str:
 
 class ExtractRequest(BaseModel):
     url: str
-    filename: Optional[str] = None
+    filename: str | None = None
     download_type: str = "audio"  # "audio" or "video"
     video_quality: str = "720p"  # "720p", "1080p", or "best"
 
@@ -131,16 +134,37 @@ class JobResponse(BaseModel):
     status: str
     progress: float
     message: str
-    filename: Optional[str] = None
-    error: Optional[str] = None
+    filename: str | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_job(cls, job: Job) -> "JobResponse":
+        return cls(
+            job_id=job.id,
+            status=job.status.value,
+            progress=job.progress,
+            message=job.message,
+            filename=job.filename,
+            error=job.error,
+        )
 
 
 # 対応するメディア拡張子
-MEDIA_EXTENSIONS = ('.mp3', '.mp4', '.wav', '.m4a', '.webm', '.ogg', '.aac', '.flac')
+MEDIA_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".webm": "video/webm",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+}
+MEDIA_EXTENSIONS = tuple(MEDIA_TYPES)
 BLOCKED_DIRECT_MEDIA_HOSTS = {"localhost", "localhost.localdomain"}
 
 
-def is_public_ip_address(ip: ipaddress._BaseAddress) -> bool:
+def is_public_ip_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return not (
         ip.is_private
         or ip.is_loopback
@@ -151,7 +175,7 @@ def is_public_ip_address(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
-def resolve_direct_media_host_ips(hostname: str) -> list[ipaddress._BaseAddress]:
+def resolve_direct_media_host_ips(hostname: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     try:
         ip = ipaddress.ip_address(hostname)
         return [ip]
@@ -173,7 +197,7 @@ def resolve_direct_media_host_ips(hostname: str) -> list[ipaddress._BaseAddress]
     return addresses
 
 
-def is_public_direct_media_host(hostname: Optional[str]) -> bool:
+def is_public_direct_media_host(hostname: str | None) -> bool:
     """直接メディアURLとしてサーバー側取得してよいホストかを判定"""
     if not hostname:
         return False
@@ -192,14 +216,14 @@ def is_public_direct_media_host(hostname: Optional[str]) -> bool:
 def is_direct_media_url(url: str) -> bool:
     """直接メディアファイルへのURLかどうかを判定"""
     # クエリパラメータを除いたパスで判定
-    from urllib.parse import urlparse
     parsed = urlparse(url.strip())
     if parsed.scheme not in ("http", "https"):
         return False
+    if not parsed.path.lower().endswith(MEDIA_EXTENSIONS):
+        return False
     if not is_public_direct_media_host(parsed.hostname):
         return False
-    path = parsed.path.lower()
-    return path.endswith(MEDIA_EXTENSIONS)
+    return True
 
 
 def validate_direct_media_response_url(url: str) -> None:
@@ -235,8 +259,8 @@ def format_bytes(size: int) -> str:
 def update_job_progress(
     job: Job,
     progress: float,
-    message: Optional[str] = None,
-    status: Optional[JobStatus] = None,
+    message: str | None = None,
+    status: JobStatus | None = None,
 ) -> None:
     progress = clamp_progress(progress)
     with jobs_lock:
@@ -248,14 +272,23 @@ def update_job_progress(
             job.message = message
 
 
+def complete_job(job: Job, output_path: Path, message: str = "完了！") -> None:
+    with jobs_lock:
+        job.status = JobStatus.COMPLETED
+        job.progress = 100.0
+        job.message = message
+        job.filename = output_path.name
+        job.completed_at = datetime.now()
+
+
 def write_streaming_response_to_file(
     response,
     output_path: Path,
-    job: Optional[Job] = None,
+    job: Job | None = None,
     progress_start: float = 0.0,
     progress_end: float = 100.0,
     message: str = "ダウンロード中...",
-    status: Optional[JobStatus] = None,
+    status: JobStatus | None = None,
 ) -> None:
     total_size = get_content_length(response.headers)
     ensure_download_size_within_limit(total_size)
@@ -331,7 +364,6 @@ def read_process_output_with_timeout(process, timeout_seconds: int):
 
 def is_supported_youtube_url(url: str) -> bool:
     """YouTubeの動画URLかどうかを判定"""
-    from urllib.parse import parse_qs, urlparse
 
     parsed = urlparse(url.strip())
     hostname = (parsed.hostname or "").lower()
@@ -379,7 +411,7 @@ def cleanup_old_jobs():
         expired_jobs = [
             job_id for job_id, job in jobs.items()
             if (
-                job.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+                job.status in TERMINAL_JOB_STATUSES
                 and (now - job.created_at).total_seconds() > 6 * 60 * 60
             )
         ]
@@ -391,44 +423,20 @@ def cleanup_old_jobs():
             del jobs[job_id]
 
 
-def parse_download_percent(line: str) -> Optional[float]:
+def parse_download_percent(line: str) -> float | None:
     if "[download]" not in line or "%" not in line:
         return None
-    try:
-        match = re.search(r"(\d+\.?\d*)%", line)
-        if match:
-            return float(match.group(1))
-    except:
-        pass
-    return None
+    match = re.search(r"(\d+\.?\d*)%", line)
+    return float(match.group(1)) if match else None
 
 
 def map_download_progress(percent: float, progress_start: float = 0.0, progress_end: float = 70.0) -> float:
     return progress_start + (percent / 100.0) * (progress_end - progress_start)
 
 
-def parse_progress(line: str) -> tuple[float, str]:
-    """yt-dlpの出力から進捗をパース"""
-    # ダウンロード進捗: [download]  45.2% of 150.00MiB at 5.00MiB/s ETA 00:20
-    percent = parse_download_percent(line)
-    if percent is not None:
-        # ダウンロードは全体の70%とみなす
-        return map_download_progress(percent), f"ダウンロード中... {percent:.1f}%"
-
-    # 変換中
-    if "[ExtractAudio]" in line:
-        return 75.0, "音声を変換中..."
-
-    # Post-processing
-    if "[Merger]" in line or "Merging" in line:
-        return 85.0, "ファイルを処理中..."
-
-    return -1, ""
-
-
 def resolve_tiktok_redirect(url: str) -> str:
     """curl_cffiを使用してTikTokの短縮URLを展開"""
-    print(f"Resolving TikTok URL: {url}")
+    logger.info('Resolving TikTok URL: %s', url)
     try:
         from curl_cffi import requests
         # リダイレクト解決（impersonateを使用してBot検知を回避しつつ）
@@ -441,19 +449,18 @@ def resolve_tiktok_redirect(url: str) -> str:
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
         )
-        print(f"Resolved URL: {url} -> {r.url}")
+        logger.info('Resolved URL: %s -> %s', url, r.url)
         return r.url
     except Exception as e:
-        print(f"Redirect resolution failed: {e}")
+        logger.warning('Redirect resolution failed: %s', e)
         return url
 
 
 def get_tiktok_video_info(url: str) -> dict:
     """tikwm.com APIを使用してTikTok動画情報を取得"""
     import requests
-    import json
 
-    print(f"Getting TikTok video info via tikwm.com API: {url}")
+    logger.info('Getting TikTok video info via tikwm.com API: %s', url)
 
     try:
         api_url = f"https://tikwm.com/api/?url={url}"
@@ -479,21 +486,21 @@ def get_tiktok_video_info(url: str) -> dict:
                 "duration": video_data.get("duration", 0),
                 "cover": video_data.get("cover", ""),
             }
-            print(f"TikTok video info retrieved: id={video_id}, title={result['title']}, duration={result['duration']}s")
+            logger.info('TikTok video info retrieved: id=%s, title=%s, duration=%ss', video_id, result['title'], result['duration'])
             return result
         else:
-            print(f"tikwm.com API error: {data.get('msg', 'Unknown error')}")
+            logger.warning('tikwm.com API error: %s', data.get('msg', 'Unknown error'))
             return {"success": False, "error": data.get("msg", "Unknown error")}
 
     except Exception as e:
-        print(f"tikwm.com API request failed: {e}")
+        logger.warning('tikwm.com API request failed: %s', e)
         return {"success": False, "error": str(e)}
 
 
 def download_tiktok_via_tiksave(
     url: str,
     output_path: str,
-    job: Optional[Job] = None,
+    job: Job | None = None,
     progress_start: float = 25.0,
     progress_end: float = 95.0,
     message: str = "予備サーバーでダウンロード中...",
@@ -501,9 +508,8 @@ def download_tiktok_via_tiksave(
     """tiksave.ioを使用してTikTok動画をダウンロード（サブスク限定動画対応）"""
     import cloudscraper
     from bs4 import BeautifulSoup
-    import os
 
-    print(f"Attempting download via tiksave.io (fallback): {url}")
+    logger.info('Attempting download via tiksave.io (fallback): %s', url)
 
     try:
         scraper = cloudscraper.create_scraper(
@@ -525,7 +531,7 @@ def download_tiktok_via_tiksave(
 
         r = scraper.post(api_url, data=data)
         if r.status_code != 200:
-            print(f"tiksave.io API failed: {r.status_code}")
+            logger.warning('tiksave.io API failed: %s', r.status_code)
             return False
 
         resp_json = r.json()
@@ -541,20 +547,20 @@ def download_tiktok_via_tiksave(
             text = btn.get_text()
             if "HD" in text:
                 download_link = btn.get('href')
-                print("Selected HD link from tiksave.io")
+                logger.info('Selected HD link from tiksave.io')
                 break
 
         # HDがなければ最初のMP4リンク
         if not download_link and buttons:
             download_link = buttons[0].get('href')
-            print("Selected Standard MP4 link from tiksave.io")
+            logger.info('Selected Standard MP4 link from tiksave.io')
 
         if not download_link:
-            print("No download link found in tiksave.io response")
+            logger.warning('No download link found in tiksave.io response')
             return False
 
         # ダウンロード実行
-        print(f"Downloading from tiksave.io: {download_link}")
+        logger.info('Downloading from tiksave.io: %s', download_link)
         headers = {
             "Referer": "https://tiksave.io/",
             "User-Agent": scraper.headers["User-Agent"]
@@ -575,17 +581,17 @@ def download_tiktok_via_tiksave(
 
             # ファイルサイズチェック
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                print(f"Download complete via tiksave.io: {output_path}")
+                logger.info('Download complete via tiksave.io: %s', output_path)
                 return True
             else:
-                print("Downloaded file is too small")
+                logger.warning('Downloaded file is too small')
                 return False
         else:
-            print(f"tiksave.io download failed: {r_down.status_code}")
+            logger.warning('tiksave.io download failed: %s', r_down.status_code)
             return False
 
     except Exception as e:
-        print(f"Error downloading via tiksave.io: {e}")
+        logger.warning('Error downloading via tiksave.io: %s', e)
         return False
 
 
@@ -618,7 +624,6 @@ def process_job(job_id: str):
                 job.message = "ファイルをダウンロード中..."
 
             import requests as req
-            from urllib.parse import urlparse, unquote
 
             # 元のファイル名から拡張子を取得
             parsed_url = urlparse(job.url)
@@ -626,11 +631,7 @@ def process_job(job_id: str):
             _, ext = os.path.splitext(original_filename)
             ext = ext.lower() if ext else '.mp3'
 
-            # 音声ファイルでaudio指定、または動画ファイルでvideo指定をチェック
-            is_audio_ext = ext in ('.mp3', '.wav', '.m4a', '.ogg', '.aac', '.flac')
-            is_video_ext = ext in ('.mp4', '.webm')
-
-            print(f"Direct media download: {job.url} (ext: {ext})")
+            logger.info('Direct media download: %s (ext: %s)', job.url, ext)
 
             response = req.get(job.url, timeout=300, stream=True, allow_redirects=False)
             if 300 <= response.status_code < 400:
@@ -651,13 +652,8 @@ def process_job(job_id: str):
                 )
 
                 # 完了
-                with jobs_lock:
-                    job.status = JobStatus.COMPLETED
-                    job.progress = 100.0
-                    job.message = "完了！"
-                    job.filename = output_path.name
-                    job.completed_at = datetime.now()
-                print(f"Direct download complete: {output_path}")
+                complete_job(job, output_path)
+                logger.info('Direct download complete: %s', output_path)
                 return
             else:
                 raise Exception(f"ダウンロードに失敗しました (HTTP {response.status_code})")
@@ -670,10 +666,9 @@ def process_job(job_id: str):
 
         target_url = job.url
         extra_opts = []
-        tiktok_info = None
 
         # TikTok特有の処理: tikwm.com APIを使用
-        if "tiktok.com" in job.url or "vt.tiktok.com" in job.url:
+        if urlparse(job.url).hostname in {"tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}:
             with jobs_lock:
                 job.message = "TikTok URLを解析中..."
 
@@ -688,7 +683,7 @@ def process_job(job_id: str):
                     # 直接ダウンロード
                     import requests as req
                     music_url = tiktok_info.get("music_url")
-                    print(f"Downloading TikTok audio directly: {music_url}")
+                    logger.info('Downloading TikTok audio directly: %s', music_url)
 
                     audio_response = req.get(music_url, timeout=120, stream=True)
                     if audio_response.status_code == 200:
@@ -704,29 +699,20 @@ def process_job(job_id: str):
                         )
 
                         # 完了
-                        with jobs_lock:
-                            job.status = JobStatus.COMPLETED
-                            job.progress = 100.0
-                            job.message = "完了！"
-                            job.filename = output_path.name
-                            job.completed_at = datetime.now()
+                        complete_job(job, output_path)
                         return  # 処理終了
                     else:
-                        print(f"Direct audio download failed: {audio_response.status_code}")
+                        logger.warning('Direct audio download failed: %s', audio_response.status_code)
                         # フォールバックしてyt-dlpを使用
-
-                # WebM/WebPなどの一時ファイルを無視する設定（既存）
 
                 # 動画ダウンロード
                 # サブスク限定動画かどうかを判定
                 title = tiktok_info.get("title", "")
                 is_subscriber_only = "サブスク" in title or "subscriber" in title.lower() or "限定" in title
 
-                download_success = False
-
                 # 1. サブスク限定動画ならTikSaveを優先
                 if job.download_type == DownloadType.VIDEO and is_subscriber_only:
-                    print(f"Subscriber-only video detected: {title}. Trying tiksave.io first.")
+                    logger.info('Subscriber-only video detected: %s. Trying tiksave.io first.', title)
                     output_path = output_dir / f"{base_filename}.mp4"
                     if download_tiktok_via_tiksave(
                         job.url,
@@ -736,17 +722,11 @@ def process_job(job_id: str):
                         progress_end=95.0,
                         message="予備サーバーでダウンロード中...",
                     ):
-                        download_success = True
-                        with jobs_lock:
-                            job.status = JobStatus.COMPLETED
-                            job.progress = 100.0
-                            job.message = "完了！（TikSave経由）"
-                            job.filename = output_path.name
-                            job.completed_at = datetime.now()
+                        complete_job(job, output_path, "完了！（TikSave経由）")
                         return
 
                 # 2. 通常のtikwm.com直接ダウンロード
-                if not download_success and job.download_type == DownloadType.VIDEO and tiktok_info.get("video_url"):
+                if job.download_type == DownloadType.VIDEO and tiktok_info.get("video_url"):
                     update_job_progress(job, 20.0, "動画をダウンロード中...", JobStatus.DOWNLOADING)
 
                     try:
@@ -754,7 +734,7 @@ def process_job(job_id: str):
                         import requests as req
                         # video_urlはget_tiktok_video_infoでtikwm.comのメディアURLになっている
                         video_url = tiktok_info.get("video_url")
-                        print(f"Downloading TikTok video directly from tikwm: {video_url}")
+                        logger.info('Downloading TikTok video directly from tikwm: %s', video_url)
 
                         video_response = req.get(video_url, timeout=300, stream=True)
 
@@ -770,24 +750,18 @@ def process_job(job_id: str):
                                 status=JobStatus.DOWNLOADING,
                             )
 
-                            print(f"Direct download successful. Size: {os.path.getsize(output_path)} bytes")
-                            download_success = True
+                            logger.info('Direct download successful. Size: %s bytes', os.path.getsize(output_path))
 
-                            with jobs_lock:
-                                job.status = JobStatus.COMPLETED
-                                job.progress = 100.0
-                                job.message = "完了！"
-                                job.filename = output_path.name
-                                job.completed_at = datetime.now()
+                            complete_job(job, output_path)
                             return
                         else:
-                            print(f"Direct video download failed: {video_response.status_code}")
+                            logger.warning('Direct video download failed: %s', video_response.status_code)
                     except Exception as e:
-                        print(f"Direct video download error: {e}")
+                        logger.warning('Direct video download error: %s', e)
 
                 # 3. TikSaveへのフォールバック（tikwmが失敗した場合）
-                if not download_success and job.download_type == DownloadType.VIDEO:
-                    print("Falling back to tiksave.io...")
+                if job.download_type == DownloadType.VIDEO:
+                    logger.info('Falling back to tiksave.io...')
                     update_job_progress(job, 20.0, "予備サーバーでダウンロード中...", JobStatus.DOWNLOADING)
 
                     output_path = output_dir / f"{base_filename}.mp4"
@@ -799,24 +773,18 @@ def process_job(job_id: str):
                         progress_end=95.0,
                         message="予備サーバーでダウンロード中...",
                     ):
-                        download_success = True
-                        with jobs_lock:
-                            job.status = JobStatus.COMPLETED
-                            job.progress = 100.0
-                            job.message = "完了！（予備サーバー経由）"
-                            job.filename = output_path.name
-                            job.completed_at = datetime.now()
+                        complete_job(job, output_path, "完了！（予備サーバー経由）")
                         return
 
                 # 4. 最終手段: yt-dlpへのフォールバック
-                print("All direct methods failed. Falling back to yt-dlp...")
+                logger.warning('All direct methods failed. Falling back to yt-dlp...')
                 target_url = tiktok_info.get("video_url") or job.url  # urlフォールバック
 
                 with jobs_lock:
                     job.message = "ダウンロード中（標準モード）..."
             else:
                 # APIが失敗した場合はフォールバック（従来の方法）
-                print(f"tikwm.com API failed, falling back to yt-dlp direct")
+                logger.warning('tikwm.com API failed, falling back to yt-dlp direct')
                 if "vt.tiktok.com" in job.url or "/t/" in job.url:
                     target_url = resolve_tiktok_redirect(job.url)
 
@@ -922,12 +890,7 @@ def process_job(job_id: str):
         output_file = output_files[0]
 
         # 完了
-        with jobs_lock:
-            job.status = JobStatus.COMPLETED
-            job.progress = 100.0
-            job.message = "完了！"
-            job.filename = output_file.name
-            job.completed_at = datetime.now()
+        complete_job(job, output_file)
 
     except subprocess.TimeoutExpired:
         process.kill()
@@ -958,7 +921,6 @@ def process_job(job_id: str):
 
 def decode_safe_job_id(job_id: str) -> str:
     """APIパスから受け取ったjob_idを一時ディレクトリ配下の1要素として検証"""
-    from urllib.parse import unquote
 
     decoded_job_id = unquote(job_id)
     if (
@@ -979,7 +941,6 @@ def decode_safe_job_id(job_id: str) -> str:
 
 def decode_safe_filename(filename: str) -> str:
     """APIパスから受け取ったfilenameをジョブディレクトリ直下の1ファイルとして検証"""
-    from urllib.parse import unquote
 
     decoded_filename = unquote(filename)
     if (
@@ -1021,7 +982,7 @@ def resolve_download_path(job_id: str, filename: str) -> tuple[str, str, Path]:
 
 
 @app.post("/api/extract", response_model=JobResponse)
-async def start_extraction(request: ExtractRequest, background_tasks: BackgroundTasks, http_request: Request):
+def start_extraction(request: ExtractRequest, http_request: Request):
     """音声抽出ジョブを開始"""
 
     # URL検証
@@ -1042,7 +1003,7 @@ async def start_extraction(request: ExtractRequest, background_tasks: Background
     video_quality = request.video_quality if request.video_quality in ["720p", "1080p", "best"] else "720p"
     job = Job(
         id=job_id,
-        url=request.url,
+        url=request.url.strip(),
         custom_filename=custom_filename,
         download_type=download_type,
         video_quality=video_quality,
@@ -1057,46 +1018,28 @@ async def start_extraction(request: ExtractRequest, background_tasks: Background
     thread = threading.Thread(target=process_job, args=(job_id,))
     thread.start()
 
-    return JobResponse(
-        job_id=job_id,
-        status=job.status.value,
-        progress=job.progress,
-        message=job.message,
-    )
+    with jobs_lock:
+        return JobResponse.from_job(job)
 
 
 @app.get("/api/job/{job_id}", response_model=JobResponse)
-async def get_job_status(job_id: str):
+def get_job_status(job_id: str):
     """ジョブのステータスを取得"""
 
     with jobs_lock:
         job = jobs.get(job_id)
-
-    if not job:
-        raise HTTPException(status_code=404, detail="ジョブが見つかりません")
-
-    return JobResponse(
-        job_id=job.id,
-        status=job.status.value,
-        progress=job.progress,
-        message=job.message,
-        filename=job.filename,
-        error=job.error,
-    )
+        if not job:
+            raise HTTPException(status_code=404, detail="ジョブが見つかりません")
+        return JobResponse.from_job(job)
 
 
 @app.get("/api/download/{job_id}/{filename}")
-async def download_audio(job_id: str, filename: str):
-    """抽出した音声ファイルをダウンロード"""
-    from urllib.parse import quote
+def download_audio(job_id: str, filename: str):
+    """抽出したメディアファイルをダウンロード"""
 
     _, decoded_filename, file_path = resolve_download_path(job_id, filename)
 
-    # 拡張子に応じてmedia_typeを決定
-    if decoded_filename.lower().endswith(".mp4"):
-        media_type = "video/mp4"
-    else:
-        media_type = "audio/mpeg"
+    media_type = MEDIA_TYPES.get(file_path.suffix.lower(), "application/octet-stream")
 
     # RFC 5987準拠のContent-Dispositionヘッダーを生成
     encoded_filename = quote(decoded_filename)
@@ -1113,13 +1056,15 @@ async def download_audio(job_id: str, filename: str):
 
 
 @app.delete("/api/job/{job_id}")
-async def delete_job(job_id: str):
+def delete_job(job_id: str):
     """ジョブと関連ファイルを削除"""
     decoded_job_id = decode_safe_job_id(job_id)
 
     with jobs_lock:
-        if decoded_job_id in jobs:
-            del jobs[decoded_job_id]
+        job = jobs.get(decoded_job_id)
+        if job and job.status not in TERMINAL_JOB_STATUSES:
+            raise HTTPException(status_code=409, detail="処理中のジョブは削除できません")
+        jobs.pop(decoded_job_id, None)
 
     job_dir = TEMP_DIR / decoded_job_id
     if job_dir.exists():
@@ -1129,6 +1074,7 @@ async def delete_job(job_id: str):
 
 
 @app.get("/api/health")
-async def health_check():
+def health_check():
     """ヘルスチェック"""
-    return {"status": "ok", "active_jobs": len(jobs)}
+    with jobs_lock:
+        return {"status": "ok", "active_jobs": count_active_jobs_locked()}

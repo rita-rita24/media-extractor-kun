@@ -7,34 +7,18 @@ import main
 
 
 @pytest.mark.parametrize(
-    ("line", "expected_progress", "expected_message"),
+    ("line", "expected_percent"),
     [
-        ("[download]   0.0% of 10.00MiB at 1.00MiB/s ETA 00:10", 0.0, "ダウンロード中... 0.0%"),
-        ("[download]  45.2% of 10.00MiB at 1.00MiB/s ETA 00:05", 31.64, "ダウンロード中... 45.2%"),
-        ("[download] 100.0% of 10.00MiB at 1.00MiB/s ETA 00:00", 70.0, "ダウンロード中... 100.0%"),
-        ("[ExtractAudio] Destination: file.mp3", 75.0, "音声を変換中..."),
-        ('[Merger] Merging formats into "file.mp4"', 85.0, "ファイルを処理中..."),
+        ("[download]   0.0% of 10.00MiB", 0.0),
+        ("[download]  45.2% of 10.00MiB", 45.2),
+        ("[download] 100.0% of 10.00MiB", 100.0),
+        ("plain log line", None),
+        ("[download] percent% of file", None),
+        ("[download] Destination: generated.mp4", None),
     ],
 )
-def test_parse_progress_maps_known_yt_dlp_lines(line, expected_progress, expected_message):
-    progress, message = main.parse_progress(line)
-
-    assert progress == pytest.approx(expected_progress)
-    assert message == expected_message
-
-
-def test_parse_progress_ignores_noise_or_unparseable_percent_lines():
-    assert main.parse_progress("plain log line") == (-1, "")
-    assert main.parse_progress("[download] percent% of file") == (-1, "")
-
-
-def test_parse_progress_returns_no_progress_when_regex_raises(monkeypatch):
-    def raising_search(*args, **kwargs):
-        raise RuntimeError("regex engine failed")
-
-    monkeypatch.setattr(main.re, "search", raising_search)
-
-    assert main.parse_progress("[download] 50.0% of file") == (-1, "")
+def test_parse_download_percent_accepts_only_numeric_download_updates(line, expected_percent):
+    assert main.parse_download_percent(line) == expected_percent
 
 
 def test_get_content_length_returns_zero_for_invalid_header_value():
@@ -92,18 +76,12 @@ def test_write_streaming_response_to_file_reports_integer_progress_steps(tmp_pat
     assert job.message == "動画をダウンロード中... 100B / 100B"
 
 
-def test_parse_progress_ignores_download_destination_as_conversion():
-    assert main.parse_progress("[download] Destination: generated.mp4") == (-1, "")
-
-
 @given(st.decimals(min_value=0, max_value=100, places=1))
-def test_parse_progress_scales_download_percent_to_seventy_percent(percent):
-    line = f"[download] {percent}% of 10.00MiB at 1.00MiB/s ETA 00:10"
+def test_download_progress_scales_percent_to_seventy_percent(percent):
+    parsed = main.parse_download_percent(f"[download] {percent}% of 10.00MiB")
 
-    progress, message = main.parse_progress(line)
-
-    assert progress == pytest.approx(float(percent) * 0.7)
-    assert message == f"ダウンロード中... {float(percent):.1f}%"
+    assert parsed == float(percent)
+    assert main.map_download_progress(parsed) == pytest.approx(float(percent) * 0.7)
 
 
 def test_cleanup_old_jobs_removes_only_old_terminal_jobs(isolated_job_store):

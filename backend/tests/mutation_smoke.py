@@ -54,7 +54,7 @@ MUTANTS = [
     },
     {
         "name": "cleanup_removes_active_old_jobs",
-        "find": "job.status in (JobStatus.COMPLETED, JobStatus.FAILED)\n                and",
+        "find": "job.status in TERMINAL_JOB_STATUSES\n                and",
         "replace": "True\n                and",
     },
     {
@@ -79,13 +79,8 @@ MUTANTS = [
     },
     {
         "name": "audio_jobs_can_complete_through_video_tiksave_fallback",
-        "find": "if not download_success and job.download_type == DownloadType.VIDEO:",
-        "replace": "if not download_success:",
-    },
-    {
-        "name": "progress_noise_reports_zero",
-        "find": 'return -1, ""',
-        "replace": 'return 0, ""',
+        "find": "if job.download_type == DownloadType.VIDEO:",
+        "replace": "if True:",
     },
 ]
 

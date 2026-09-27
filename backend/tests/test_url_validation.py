@@ -7,6 +7,20 @@ from hypothesis import given, strategies as st
 import main
 
 
+def test_social_page_validation_does_not_resolve_direct_media_dns(monkeypatch):
+    def unexpected_dns_lookup(hostname):
+        raise AssertionError("Social page validation must not perform direct-media DNS lookups")
+
+    monkeypatch.setattr(main, "resolve_direct_media_host_ips", unexpected_dns_lookup)
+
+    assert main.validate_video_url("https://www.youtube.com/watch?v=abc_123")
+
+
+@pytest.mark.parametrize("scheme", ["ftp", "file", "gopher"])
+def test_direct_media_rejects_non_http_schemes_on_public_hosts(scheme):
+    assert not main.is_direct_media_url(f"{scheme}://93.184.216.34/audio.mp3")
+
+
 @pytest.mark.parametrize(
     "url",
     [

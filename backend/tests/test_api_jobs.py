@@ -157,11 +157,44 @@ def test_health_reports_active_job_count(client):
     with main.jobs_lock:
         main.jobs[str(uuid.uuid4())] = main.Job(id=str(uuid.uuid4()), url="https://youtu.be/a")
         main.jobs[str(uuid.uuid4())] = main.Job(id=str(uuid.uuid4()), url="https://youtu.be/b")
+        main.jobs["completed"] = main.Job(id="completed", url="https://youtu.be/c", status=main.JobStatus.COMPLETED)
+        main.jobs["failed"] = main.Job(id="failed", url="https://youtu.be/d", status=main.JobStatus.FAILED)
 
     response = client.get("/api/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "active_jobs": 2}
+
+
+def test_delete_job_preserves_running_job_and_its_files(client, isolated_job_store):
+    job_id = str(uuid.uuid4())
+    job_dir = isolated_job_store / job_id
+    job_dir.mkdir()
+    partial_file = job_dir / "clip.part"
+    partial_file.write_bytes(b"partial")
+    with main.jobs_lock:
+        main.jobs[job_id] = main.Job(id=job_id, url="https://youtu.be/a", status=main.JobStatus.DOWNLOADING)
+
+    response = client.delete(f"/api/job/{job_id}")
+
+    assert response.status_code == 409
+    assert partial_file.read_bytes() == b"partial"
+    assert client.get(f"/api/job/{job_id}").json()["status"] == "downloading"
+
+
+def test_start_extraction_includes_filename_if_worker_finishes_immediately(client, monkeypatch):
+    class ImmediateThread(NoopThread):
+        def start(self):
+            job = main.jobs[self.args[0]]
+            main.complete_job(job, main.TEMP_DIR / "finished.mp3")
+
+    monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
+
+    response = client.post("/api/extract", json={"url": "https://youtu.be/abc_123"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["filename"] == "finished.mp3"
 
 
 def test_cors_allows_local_frontend_origin_but_not_untrusted_origin(client):

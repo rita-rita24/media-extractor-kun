@@ -2,6 +2,8 @@ from datetime import datetime
 from urllib.parse import quote
 import uuid
 
+import pytest
+
 import main
 
 
@@ -55,3 +57,18 @@ def test_download_rejects_files_not_registered_on_the_job(client):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "ファイルが見つかりません"
+
+
+@pytest.mark.parametrize(
+    ("extension", "media_type"),
+    [("wav", "audio/wav"), ("m4a", "audio/mp4"), ("webm", "video/webm"),
+     ("ogg", "audio/ogg"), ("aac", "audio/aac"), ("flac", "audio/flac")],
+)
+def test_download_preserves_direct_media_content_type(client, extension, media_type):
+    filename = f"clip.{extension}"
+    job_id = create_completed_job(filename)
+
+    response = client.get(f"/api/download/{job_id}/{filename}")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == media_type

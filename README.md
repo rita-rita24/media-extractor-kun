@@ -54,7 +54,7 @@ YouTube / TikTok / Instagram / X などの動画URLから、音声（MP3）ま�
 事前に以下をインストールしてください。
 
 - Node.js
-- Python 3
+- Python 3.10以上
 - ffmpeg
 
 `yt-dlp` は Python の依存関係としてセットアップ時にインストールされます。ただし、OS側のコマンドとして `yt-dlp` を使える状態にしておくとトラブルシュートしやすくなります。
@@ -187,6 +187,21 @@ npm run build
 ```
 
 本番配信する場合は `frontend/dist` を静的配信し、`/api` を FastAPI にリバースプロキシします。
+
+## 開発・テスト
+
+```bash
+npm run setup:api:dev
+npm --prefix frontend exec -- playwright install chromium
+npm run test:api
+npm run test:e2e
+```
+
+E2Eテストは本番ビルドを作成し、専用ポート `4173` でPC・モバイルの操作を確認します。APIレスポンスはモック化し、外部サイトからの実ダウンロードは行いません。
+
+フロントエンドは画面（`App.tsx`）、モーダル（`components/ExtractModal.tsx`）、ジョブの通信・状態管理（`hooks/useExtraction.ts`）、API応答とURLの検証（`lib/`）に分けています。CSSは標準のネスト構文を使い、状態・画面幅別の指定を各ルール内にまとめています。
+
+ブラウザはCSSネスト、`:has()`、`dialog`、`AbortSignal.any()`に対応したバージョンを使用してください。
 
 ## トラブルシュート
 
